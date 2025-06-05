@@ -1,0 +1,14 @@
+{
+  "name": "webman/sequency",
+  "description": "Redis message queue plugin with priority control for webman.",
+  "require": {
+    "php": ">=8.1",
+    "workerman/webman-framework": "^2.1.2 || dev-master",
+    "ext-redis": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "Webman\\Sequency\\": "./src"
+    }
+  }
+}
