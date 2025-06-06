@@ -7,7 +7,7 @@ use RecursiveIteratorIterator;
 
 class Install
 {
-  const WEBMAN_PLUGIN = true;
+  const bool WEBMAN_PLUGIN = true;
 
   /**
    * @var array
@@ -29,7 +29,6 @@ class Install
       file_put_contents($consumer_dir . '/.gitignore', "*\n!.gitignore\n!readme.md\n");
       file_put_contents($consumer_dir . '/readme.md', "This directory is for Webman\\Sequency consumer classes.\n");
     }
-    echo "Webman\\Sequency installed successfully. Please configure your queues and consumers.\n";
   }
 
   /**

@@ -6,14 +6,12 @@ use FilesystemIterator;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
 use support\Container;
-use support\Log;
 use Webman\Sequency\Redis;
 use Webman\Sequency\RedisConnection;
 use Webman\Sequency\Consumer as ConsumerInterface;
 use Webman\Sequency\NonRetryableException;
 use Workerman\Timer;
 use Throwable;
-use Psr\Log\LoggerInterface;
 
 class Consumer
 {
@@ -22,31 +20,20 @@ class Consumer
    * @var ConsumerInterface[] Stores ConsumerInterface instances keyed by their redisQueueKey
    */
   protected array $_consumers = [];
-  protected ?LoggerInterface $_logger = null;
   protected ?int $_delayedQueueTimerId = null;
   /**
    * @var array Stores pull timer IDs keyed by their redisQueueKey
    */
   protected array $_pullTimerIds = [];
 
-  public function __construct($consumer_dir = '', $loggerChannel = 'plugin.webman.sequency.default')
+  public function __construct($consumer_dir = '')
   {
     $this->_consumerDir = $consumer_dir;
-    if (class_exists(Log::class) && $loggerChannel) {
-      try {
-        /** @var LoggerInterface $loggerInstance */
-        $loggerInstance = Log::channel($loggerChannel);
-        $this->_logger = $loggerInstance;
-      } catch (Throwable $e) {
-        echo "Error initializing logger for Sequency: " . $e->getMessage() . "\n";
-      }
-    }
   }
 
   public function onWorkerStart()
   {
     if (!is_dir($this->_consumerDir)) {
-      $this->log("Consumer directory {$this->_consumerDir} not exists");
       return;
     }
     $dir_iterator = new RecursiveDirectoryIterator($this->_consumerDir, FilesystemIterator::SKIP_DOTS);
@@ -68,22 +55,16 @@ class Consumer
         $consumerInstance = Container::get($class);
         // 消费者类必须定义 public $queue 属性
         if (!property_exists($consumerInstance, 'queue') || empty($consumerInstance->queue)) {
-          $this->log("Consumer $class's public \$queue property is not set or empty.");
           continue;
         }
         $queueName = $consumerInstance->queue;
         $redisQueueKey = RedisConnection::QUEUE_WAITING_PREFIX . $queueName;
         $this->_consumers[$redisQueueKey] = $consumerInstance;
-        $connectionNameForLog = property_exists($consumerInstance, 'connection') && !empty($consumerInstance->connection)
-          ? $consumerInstance->connection
-          : 'default';
-        $this->log("Discovered consumer for '$queueName' (key: $redisQueueKey - SortedSet) using connection '$connectionNameForLog'");
-      } catch (Throwable $e) {
-        $this->log("Error loading consumer $class: " . $e->getMessage() . "\n" . $e->getTraceAsString());
+      } catch (Throwable) {
       }
     }
     foreach ($this->_consumers as $redisQueueKey => $consumerInstance) {
-      $this->_pullTimerIds[$redisQueueKey] = Timer::add(0.01, function () use ($consumerInstance, $redisQueueKey) {
+      $this->_pullTimerIds[$redisQueueKey] = Timer::add(0.001, function () use ($consumerInstance, $redisQueueKey) {
         $this->tryConsume($consumerInstance, $redisQueueKey);
       });
     }
@@ -101,7 +82,6 @@ class Consumer
             reset($allConnections);
             $defaultConnectionForDelayed = key($allConnections);
           } else {
-            $this->log("No Redis connections configured for Sequency delayed queue processor.");
             return;
           }
         }
@@ -113,7 +93,7 @@ class Consumer
         }
         foreach ($messagesToProcess as $packedMessage) {
           if ($redis->execCommand('zRem', RedisConnection::QUEUE_DELAYED_KEY, $packedMessage)) {
-            $messageData = json_decode_lite($packedMessage, true);
+            $messageData = igbinary_unserialize($packedMessage);
             if (is_array($messageData) && isset($messageData['queue'], $messageData['time'])) {
               $targetWaitingQueue = RedisConnection::QUEUE_WAITING_PREFIX . $messageData['queue'];
               // 查找对应的消费者实例以确定连接 (如果需要为每个队列使用不同连接处理延迟任务的转移)
@@ -124,15 +104,12 @@ class Consumer
               $score = RedisConnection::calculatePriorityScore($priority, $originalEnqueueTime);
               // 假设所有等待队列都在同一个Redis实例上，或者 $redis 可以处理所有键
               $redis->execCommand('zAdd', $targetWaitingQueue, $score, $packedMessage);
-              $this->log("Moved delayed job ID {$messageData['id']} (Priority: $priority) to {$targetWaitingQueue} with score $score using connection '{$defaultConnectionForDelayed}'");
             } else {
-              $this->log("Invalid delayed message format or missing queue/priority/time: $packedMessage. Moving to failed.");
               $this->failMessage($packedMessage, $redis, "Invalid format or missing queue/priority/time from delayed queue");
             }
           }
         }
-      } catch (Throwable $e) {
-        $this->log("Error processing delayed queue: " . $e->getMessage() . "\n" . $e->getTraceAsString());
+      } catch (Throwable) {
       }
     });
   }
@@ -146,9 +123,8 @@ class Consumer
       $result = $redis->execCommand('zPopMin', $redisQueueKey, 1);
       if (is_array($result) && !empty($result)) {
         $packedMessage = key($result);
-        $message = json_decode_lite($packedMessage, true);
+        $message = igbinary_unserialize($packedMessage);
         if (!is_array($message) || !isset($message['data']) || !isset($message['attempts'])) {
-          $this->log("Invalid message format from {$redisQueueKey}: $packedMessage. Moving to failed.");
           $this->failMessage($packedMessage, $redis, "Invalid message format");
           return;
         }
@@ -159,36 +135,26 @@ class Consumer
         $retrySeconds = property_exists($consumerInstance, 'retrySeconds') && is_int($consumerInstance->retrySeconds)
           ? $consumerInstance->retrySeconds
           : ($globalRedisConfig['retry_seconds'] ?? 5);
-        // $queueName可以直接从 $consumerInstance->queue 获取
-        $queueName = $consumerInstance->queue;
         try {
-          $this->log("Consuming job ID {$message['id']} from {$queueName} (Priority: {$message['priority']}, Attempt: " . ((int)$message['attempts'] + 1) . ")");
           $consumerInstance->consume($message['data']);
-          $this->log("Successfully consumed job ID {$message['id']}");
         } catch (NonRetryableException $e) {
-          $this->log("Non-retryable error consuming job ID {$message['id']}: " . $e->getMessage() . ". Moving to failed.");
           $this->failMessage($packedMessage, $redis, $e->getMessage(), $consumerInstance, $message['data'], $e);
         } catch (Throwable $e) {
           $message['attempts'] = ((int)$message['attempts'] ?? 0) + 1;
-          $this->log("Error consuming job ID {$message['id']}, attempt {$message['attempts']}: " . $e->getMessage());
           if ($message['attempts'] >= $maxAttempts) {
-            $this->log("Job ID {$message['id']} reached max attempts ({$maxAttempts}). Moving to failed.");
-            $this->failMessage(json_encode_lite($message), $redis, $e->getMessage(), $consumerInstance, $message['data'], $e);
+            $this->failMessage(igbinary_serialize($message), $redis, $e->getMessage(), $consumerInstance, $message['data'], $e);
           } else {
             $delay = $retrySeconds * pow(2, $message['attempts'] - 1);
             $message['delay'] = $delay;
             $retryAt = time() + $delay;
-            $this->log("Retrying job ID {$message['id']} in {$delay}s (at {$retryAt}). Attempt {$message['attempts']}. Priority {$message['priority']}.");
             try {
-              $redis->execCommand('zAdd', RedisConnection::QUEUE_DELAYED_KEY, $retryAt, json_encode_lite($message));
-            } catch (Throwable $e) {
-              $this->log("Failed to add job ID {$message['id']} to delayed queue for retry: " . $e->getMessage());
+              $redis->execCommand('zAdd', RedisConnection::QUEUE_DELAYED_KEY, $retryAt, igbinary_serialize($message));
+            } catch (Throwable) {
             }
           }
         }
       }
-    } catch (Throwable $e) {
-      $this->log("Error in ZPOPMIN loop for $redisQueueKey: " . $e->getMessage() . "\n" . $e->getTraceAsString());
+    } catch (Throwable) {
       if (isset($this->_pullTimerIds[$redisQueueKey])) { // 使用 $redisQueueKey 来删除特定的定时器
         Timer::del($this->_pullTimerIds[$redisQueueKey]);
       }
@@ -201,13 +167,13 @@ class Consumer
 
   protected function failMessage(string $packedMessageOriginal, RedisConnection $redis, string $errorMessage, ?ConsumerInterface $consumer = null, $data = null, ?Throwable $exception = null): void
   {
-    $message = json_decode_lite($packedMessageOriginal, true);
+    $message = igbinary_unserialize($packedMessageOriginal);
     if (is_array($message)) {
       $message['error'] = $errorMessage;
       $message['failed_at'] = date('Y-m-d H:i:s');
-      $packedMessageToStore = json_encode_lite($message);
+      $packedMessageToStore = igbinary_serialize($message);
     } else {
-      $packedMessageToStore = json_encode_lite([
+      $packedMessageToStore = igbinary_serialize([
         'original_payload' => $packedMessageOriginal,
         'error' => $errorMessage,
         'failed_at' => date('Y-m-d H:i:s')
@@ -215,25 +181,13 @@ class Consumer
     }
     try {
       $redis->execCommand('lPush', RedisConnection::QUEUE_FAILED_KEY, $packedMessageToStore);
-      $this->log("Moved job to failed queue. ID " . ($message['id'] ?? 'unknown') . ". Reason: $errorMessage");
-    } catch (Throwable $e) {
-      $this->log("Failed to move job ID " . ($message['id'] ?? 'unknown') . " to failed queue: " . $e->getMessage());
+    } catch (Throwable) {
     }
     if ($consumer && method_exists($consumer, 'onFail') && $data !== null && $exception !== null) {
       try {
         $consumer->onFail($data, $exception);
-      } catch (Throwable $e) {
-        $this->log("Error in consumer's onFail method for job ID " . ($message['id'] ?? 'unknown') . ": " . $e->getMessage());
+      } catch (Throwable) {
       }
-    }
-  }
-
-  protected function log(string $message): void
-  {
-    if ($this->_logger) {
-      $this->_logger->info($message);
-    } else {
-      echo date('Y-m-d H:i:s') . ' [Sequency] ' . $message . "\n";
     }
   }
 

@@ -9,11 +9,11 @@ class RedisConnection extends \Redis
 {
   protected array $config = [];
   // Define queue names for Sequency
-  const QUEUE_WAITING_PREFIX = '{sequency}-waiting:'; // Prefix for sorted sets (per queue)
-  const QUEUE_DELAYED_KEY = '{sequency}-delayed';     // Single key for all delayed jobs (Sorted Set)
-  const QUEUE_FAILED_KEY = '{sequency}-failed';       // Single key for all failed jobs (List)
-  const MAX_INPUT_PRIORITY = 999; // The highest number the user will pass for priority, any value larger than this will regard same
-  const MIN_INPUT_PRIORITY = 0;
+  const string QUEUE_WAITING_PREFIX = '{sequency}-waiting:'; // Prefix for sorted sets (per queue)
+  const string QUEUE_DELAYED_KEY = '{sequency}-delayed';     // Single key for all delayed jobs (Sorted Set)
+  const string QUEUE_FAILED_KEY = '{sequency}-failed';       // Single key for all failed jobs (List)
+  const int MAX_INPUT_PRIORITY = 999; // The highest number the user will pass for priority, any value larger than this will regard same
+  const int MIN_INPUT_PRIORITY = 0;
 
   public function connectWithConfig(array $config = []): void
   {
@@ -94,7 +94,7 @@ class RedisConnection extends \Redis
   {
     $priority = $priority ?? 0;
     $now = time(); // Original enqueue time
-    $packageStr = json_encode_lite([
+    $packageStr = igbinary_serialize([
       'id' => uuid_create(),
       'time' => $now, // Store the original enqueue time
       'delay' => $delay,

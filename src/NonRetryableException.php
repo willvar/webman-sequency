@@ -2,6 +2,8 @@
 
 namespace Webman\Sequency;
 
-class NonRetryableException extends \Exception
+use Exception;
+
+class NonRetryableException extends Exception
 {
 }
