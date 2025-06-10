@@ -12,6 +12,7 @@ class RedisConnection extends \Redis
   const string QUEUE_WAITING_PREFIX = '{sequency}-waiting:'; // Prefix for sorted sets (per queue)
   const string QUEUE_DELAYED_KEY = '{sequency}-delayed';     // Single key for all delayed jobs (Sorted Set)
   const string QUEUE_FAILED_KEY = '{sequency}-failed';       // Single key for all failed jobs (List)
+  const string QUEUE_TASK_INDEX_KEY = '{sequency}-tasks';      // Hash to map taskId to its package string for fast cancellation.
   const int MAX_INPUT_PRIORITY = 999; // The highest number the user will pass for priority, any value larger than this will regard same
   const int MIN_INPUT_PRIORITY = 0;
 
@@ -87,29 +88,80 @@ class RedisConnection extends \Redis
    * @param mixed $data The data to be queued.
    * @param int $delay Delay in seconds.
    * @param int|null $priority The priority of the job (e.g., 1-10, higher number means higher priority).
-   * @return bool
+   * @param string|null $taskId
+   * @return string|false The task ID on success, false on failure.
    * @throws Throwable
    */
-  public function send(string $queueName, mixed $data, int $delay = 0, ?int $priority = null): bool
+  public function send(string $queueName, mixed $data, int $delay = 0, ?int $priority = null, ?string $taskId = null): string|false
   {
     $priority = $priority ?? 0;
-    $now = time(); // Original enqueue time
-    $packageStr = igbinary_serialize([
-      'id' => uuid_create(),
-      'time' => $now, // Store the original enqueue time
+    $now = time();
+    $taskId = $taskId ?? uuid_create();
+    $package = [
+      'id' => $taskId,
+      'time' => $now,
       'delay' => $delay,
       'attempts' => 0,
       'queue' => $queueName,
-      'priority' => $priority, // Store the job's priority
+      'priority' => $priority,
       'data' => $data
-    ]);
+    ];
+    $packageStr = igbinary_serialize($package);
+
+    // Atomically add to the queue and the task index
+    $this->multi();
+    $this->hSet(self::QUEUE_TASK_INDEX_KEY, $taskId, $packageStr);
+
     if ($delay > 0) {
-      // All delayed jobs go into one sorted set, scored by their execution time.
-      // The package contains the target queue and priority.
-      return (bool)$this->execCommand('zAdd', self::QUEUE_DELAYED_KEY, $now + $delay, $packageStr);
+      $this->zAdd(self::QUEUE_DELAYED_KEY, $now + $delay, $packageStr);
+    } else {
+      $score = self::calculatePriorityScore($priority, $now);
+      $this->zAdd(self::QUEUE_WAITING_PREFIX . $queueName, $score, $packageStr);
     }
-    // Immediate jobs go to their specific queue's sorted set, scored by priority and time.
-    $score = self::calculatePriorityScore($priority, $now);
-    return (bool)$this->execCommand('zAdd', self::QUEUE_WAITING_PREFIX . $queueName, $score, $packageStr);
+
+    $result = $this->exec();
+
+    // Check if all commands in the transaction succeeded
+    if ($result && !in_array(false, $result, true)) {
+      return $taskId;
+    }
+
+    // If something failed, attempt to clean up the index entry
+    $this->hDel(self::QUEUE_TASK_INDEX_KEY, $taskId);
+    return false;
+  }
+
+  /**
+   * Cancel a message from a sequency queue. (Optimized version)
+   * @param string $queueName The specific queue name. This is kept for API consistency but not strictly needed for the lookup.
+   * @param string $taskId The ID of the task to cancel.
+   * @return bool
+   * @throws Throwable
+   */
+  public function cancel(string $queueName, string $taskId): bool
+  {
+    // Look up the task package by its ID from the hash index.
+    $packageStr = $this->execCommand('hGet', self::QUEUE_TASK_INDEX_KEY, $taskId);
+    if (empty($packageStr)) {
+      // Task does not exist or has already been processed.
+      return false;
+    }
+    $task = igbinary_unserialize($packageStr);
+    if (!$task || !isset($task['delay'])) {
+      // Invalid package, try to clean up the index.
+      $this->execCommand('hDel', self::QUEUE_TASK_INDEX_KEY, $taskId);
+      return false;
+    }
+    // Determine which queue the task is in.
+    $isDelayed = ($task['delay'] > 0 && $task['attempts'] === 0) || ($task['attempts'] > 0);
+    $queueKey = $isDelayed ? self::QUEUE_DELAYED_KEY : self::QUEUE_WAITING_PREFIX . $task['queue'];
+    // Atomically remove the task from the correct queue and from the index hash.
+    $this->multi();
+    $this->zRem($queueKey, $packageStr);
+    $this->hDel(self::QUEUE_TASK_INDEX_KEY, $taskId);
+    $result = $this->exec();
+
+    // The zRem result is at index 0. It returns the number of elements removed (0 or 1).
+    return isset($result[0]) && $result[0] > 0;
   }
 }

@@ -16,14 +16,8 @@ use Throwable;
 class Consumer
 {
   protected string $_consumerDir = '';
-  /**
-   * @var ConsumerInterface[] Stores ConsumerInterface instances keyed by their redisQueueKey
-   */
   protected array $_consumers = [];
   protected ?int $_delayedQueueTimerId = null;
-  /**
-   * @var array Stores pull timer IDs keyed by their redisQueueKey
-   */
   protected array $_pullTimerIds = [];
 
   public function __construct($consumer_dir = '')
@@ -51,9 +45,7 @@ class Consumer
         continue;
       }
       try {
-        /** @var ConsumerInterface $consumerInstance */
         $consumerInstance = Container::get($class);
-        // 消费者类必须定义 public $queue 属性
         if (!property_exists($consumerInstance, 'queue') || empty($consumerInstance->queue)) {
           continue;
         }
@@ -73,11 +65,9 @@ class Consumer
     }
     $this->_delayedQueueTimerId = Timer::add(1, function () {
       try {
-        // 考虑使 'default' 连接可配置，或从某个主消费者/全局配置获取
-        $defaultConnectionForDelayed = 'default'; // 或更智能的逻辑
+        $defaultConnectionForDelayed = 'default';
         $allConnections = config('sequency', config('plugin.webman.sequency.redis', []));
         if (!isset($allConnections[$defaultConnectionForDelayed])) {
-          //尝试获取第一个可用的连接配置作为延迟队列处理器连接
           if (!empty($allConnections)) {
             reset($allConnections);
             $defaultConnectionForDelayed = key($allConnections);
@@ -96,13 +86,10 @@ class Consumer
             $messageData = igbinary_unserialize($packedMessage);
             if (is_array($messageData) && isset($messageData['queue'], $messageData['time'])) {
               $targetWaitingQueue = RedisConnection::QUEUE_WAITING_PREFIX . $messageData['queue'];
-              // 查找对应的消费者实例以确定连接 (如果需要为每个队列使用不同连接处理延迟任务的转移)
-              // 简单起见，这里仍然使用 $defaultConnectionForDelayed 进行 zAdd
-              // 但如果目标队列的消费者在不同连接上，理论上应该用那个连接
               $priority = (int)($messageData['priority'] ?? 0);
               $originalEnqueueTime = (int)$messageData['time'];
               $score = RedisConnection::calculatePriorityScore($priority, $originalEnqueueTime);
-              // 假设所有等待队列都在同一个Redis实例上，或者 $redis 可以处理所有键
+              // When moving from delayed to waiting, the index entry remains. It only gets deleted on final success/failure.
               $redis->execCommand('zAdd', $targetWaitingQueue, $score, $packedMessage);
             } else {
               $this->failMessage($packedMessage, $redis, "Invalid format or missing queue/priority/time from delayed queue");
@@ -117,48 +104,48 @@ class Consumer
   protected function tryConsume(ConsumerInterface $consumerInstance, string $redisQueueKey): void
   {
     try {
-      // 从消费者实例或全局配置中获取 maxAttempts 和 retrySeconds
       $connectionName = property_exists($consumerInstance, 'connection') && !empty($consumerInstance->connection) ? $consumerInstance->connection : 'default';
       $redis = Redis::connection($connectionName);
       $result = $redis->execCommand('zPopMin', $redisQueueKey, 1);
       if (is_array($result) && !empty($result)) {
         $packedMessage = key($result);
         $message = igbinary_unserialize($packedMessage);
-        if (!is_array($message) || !isset($message['data']) || !isset($message['attempts'])) {
+        if (!is_array($message) || !isset($message['data']) || !isset($message['attempts']) || !isset($message['id'])) {
           $this->failMessage($packedMessage, $redis, "Invalid message format");
           return;
         }
         $globalRedisConfig = config('sequency', config('plugin.webman.sequency.redis', []))[$connectionName]['options'] ?? [];
-        $maxAttempts = property_exists($consumerInstance, 'maxAttempts') && is_int($consumerInstance->maxAttempts)
-          ? $consumerInstance->maxAttempts
-          : ($globalRedisConfig['max_attempts'] ?? 5);
-        $retrySeconds = property_exists($consumerInstance, 'retrySeconds') && is_int($consumerInstance->retrySeconds)
-          ? $consumerInstance->retrySeconds
-          : ($globalRedisConfig['retry_seconds'] ?? 5);
+        $maxAttempts = property_exists($consumerInstance, 'maxAttempts') && is_int($consumerInstance->maxAttempts) ? $consumerInstance->maxAttempts : ($globalRedisConfig['max_attempts'] ?? 5);
+        $retrySeconds = property_exists($consumerInstance, 'retrySeconds') && is_int($consumerInstance->retrySeconds) ? $consumerInstance->retrySeconds : ($globalRedisConfig['retry_seconds'] ?? 5);
+
         try {
           $consumerInstance->consume($message['data']);
+          // On success, remove the task from the index.
+          $redis->execCommand('hDel', RedisConnection::QUEUE_TASK_INDEX_KEY, $message['id']);
         } catch (NonRetryableException $e) {
           $this->failMessage($packedMessage, $redis, $e->getMessage(), $consumerInstance, $message['data'], $e);
         } catch (Throwable $e) {
           $message['attempts'] = ((int)$message['attempts'] ?? 0) + 1;
+          $updatedPackedMessage = igbinary_serialize($message);
+
           if ($message['attempts'] >= $maxAttempts) {
-            $this->failMessage(igbinary_serialize($message), $redis, $e->getMessage(), $consumerInstance, $message['data'], $e);
+            $this->failMessage($updatedPackedMessage, $redis, $e->getMessage(), $consumerInstance, $message['data'], $e);
           } else {
+            // Task is being retried, so we need to update its package in the index.
             $delay = $retrySeconds * pow(2, $message['attempts'] - 1);
-            $message['delay'] = $delay;
             $retryAt = time() + $delay;
-            try {
-              $redis->execCommand('zAdd', RedisConnection::QUEUE_DELAYED_KEY, $retryAt, igbinary_serialize($message));
-            } catch (Throwable) {
-            }
+
+            $redis->multi();
+            $redis->hSet(RedisConnection::QUEUE_TASK_INDEX_KEY, $message['id'], $updatedPackedMessage);
+            $redis->zAdd(RedisConnection::QUEUE_DELAYED_KEY, $retryAt, $updatedPackedMessage);
+            $redis->exec();
           }
         }
       }
     } catch (Throwable) {
-      if (isset($this->_pullTimerIds[$redisQueueKey])) { // 使用 $redisQueueKey 来删除特定的定时器
+      if (isset($this->_pullTimerIds[$redisQueueKey])) {
         Timer::del($this->_pullTimerIds[$redisQueueKey]);
       }
-      // 重新启动定时器时也传递 $redisQueueKey
       $this->_pullTimerIds[$redisQueueKey] = Timer::add(5, function () use ($consumerInstance, $redisQueueKey) {
         $this->tryConsume($consumerInstance, $redisQueueKey);
       });
@@ -172,6 +159,10 @@ class Consumer
       $message['error'] = $errorMessage;
       $message['failed_at'] = date('Y-m-d H:i:s');
       $packedMessageToStore = igbinary_serialize($message);
+      // On final failure, remove the task from the index.
+      if (isset($message['id'])) {
+        $redis->execCommand('hDel', RedisConnection::QUEUE_TASK_INDEX_KEY, $message['id']);
+      }
     } else {
       $packedMessageToStore = igbinary_serialize([
         'original_payload' => $packedMessageOriginal,
