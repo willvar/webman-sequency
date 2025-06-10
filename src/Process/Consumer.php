@@ -6,8 +6,8 @@ use FilesystemIterator;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
 use support\Container;
-use Webman\Sequency\Redis;
-use Webman\Sequency\RedisConnection;
+use support\Redis;
+use Webman\Sequency\Client;
 use Webman\Sequency\Consumer as ConsumerInterface;
 use Webman\Sequency\NonRetryableException;
 use Workerman\Timer;
@@ -17,6 +17,7 @@ class Consumer
 {
   protected string $_consumerDir = '';
   protected array $_consumers = [];
+  protected array $_queueToConsumerMap = [];
   protected ?int $_delayedQueueTimerId = null;
   protected array $_pullTimerIds = [];
 
@@ -30,69 +31,47 @@ class Consumer
     if (!is_dir($this->_consumerDir)) {
       return;
     }
-    $dir_iterator = new RecursiveDirectoryIterator($this->_consumerDir, FilesystemIterator::SKIP_DOTS);
-    $iterator = new RecursiveIteratorIterator($dir_iterator);
+    $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($this->_consumerDir, FilesystemIterator::SKIP_DOTS));
     foreach ($iterator as $file) {
       if ($file->isDir() || $file->getExtension() !== 'php') {
         continue;
       }
-      $relativePath = str_replace(base_path() . '/', '', $file->getPathname());
-      $class = str_replace(['/', '.php'], ['\\', ''], $relativePath);
-      if (str_starts_with($file->getPathname(), app_path())) {
-        $class = 'app\\' . str_replace(['/', '.php'], ['\\', ''], substr($file->getPathname(), strlen(app_path() . '/')));
+      $class = str_replace([base_path() . '/', '/', '.php'], ['', '\\', ''], $file->getPathname());
+      if (str_starts_with($class, 'app\\')) {
+        $class = 'app\\' . substr($class, strlen('app/'));
       }
       if (!is_a($class, ConsumerInterface::class, true)) {
         continue;
       }
       try {
-        $consumerInstance = Container::get($class);
-        if (!property_exists($consumerInstance, 'queue') || empty($consumerInstance->queue)) {
+        $consumer = Container::get($class);
+        if (empty($consumer->queue)) {
           continue;
         }
-        $queueName = $consumerInstance->queue;
-        $redisQueueKey = RedisConnection::QUEUE_WAITING_PREFIX . $queueName;
-        $this->_consumers[$redisQueueKey] = $consumerInstance;
+        $this->_consumers[Client::QUEUE_WAITING_PREFIX . $consumer->queue] = $consumer;
+        $this->_queueToConsumerMap[$consumer->queue] = $consumer;
       } catch (Throwable) {
       }
     }
-    foreach ($this->_consumers as $redisQueueKey => $consumerInstance) {
-      $this->_pullTimerIds[$redisQueueKey] = Timer::add(0.001, function () use ($consumerInstance, $redisQueueKey) {
-        $this->tryConsume($consumerInstance, $redisQueueKey);
-      });
+    foreach ($this->_consumers as $key => $consumer) {
+      $this->_pullTimerIds[$key] = Timer::add(0.001, fn() => $this->tryConsume($consumer, $key));
     }
     if ($this->_delayedQueueTimerId) {
       Timer::del($this->_delayedQueueTimerId);
     }
     $this->_delayedQueueTimerId = Timer::add(1, function () {
       try {
-        $defaultConnectionForDelayed = 'default';
-        $allConnections = config('sequency', config('plugin.webman.sequency.redis', []));
-        if (!isset($allConnections[$defaultConnectionForDelayed])) {
-          if (!empty($allConnections)) {
-            reset($allConnections);
-            $defaultConnectionForDelayed = key($allConnections);
-          } else {
-            return;
-          }
-        }
-        $redis = Redis::connection($defaultConnectionForDelayed);
-        $now = time();
-        $messagesToProcess = $redis->execCommand('zRangeByScore', RedisConnection::QUEUE_DELAYED_KEY, '-inf', (string)$now, ['LIMIT', 0, 100]);
-        if (empty($messagesToProcess)) {
-          return;
-        }
-        foreach ($messagesToProcess as $packedMessage) {
-          if ($redis->execCommand('zRem', RedisConnection::QUEUE_DELAYED_KEY, $packedMessage)) {
-            $messageData = igbinary_unserialize($packedMessage);
-            if (is_array($messageData) && isset($messageData['queue'], $messageData['time'])) {
-              $targetWaitingQueue = RedisConnection::QUEUE_WAITING_PREFIX . $messageData['queue'];
-              $priority = (int)($messageData['priority'] ?? 0);
-              $originalEnqueueTime = (int)$messageData['time'];
-              $score = RedisConnection::calculatePriorityScore($priority, $originalEnqueueTime);
-              // When moving from delayed to waiting, the index entry remains. It only gets deleted on final success/failure.
-              $redis->execCommand('zAdd', $targetWaitingQueue, $score, $packedMessage);
+        $redis = Redis::connection();
+        $messages = $redis->zRangeByScore(Client::QUEUE_DELAYED_KEY, '-inf', (string)time(), ['LIMIT', 0, 100]);
+        foreach ($messages as $packedMessage) {
+          if ($redis->zRem(Client::QUEUE_DELAYED_KEY, $packedMessage)) {
+            $msg = igbinary_unserialize($packedMessage);
+            if (is_array($msg) && isset($msg['queue'], $msg['time'])) {
+              $conn = $this->_queueToConsumerMap[$msg['queue']]->connection ?? 'default';
+              $score = Client::calculatePriorityScore((int)($msg['priority'] ?? 0), (int)$msg['time']);
+              Redis::connection($conn)->zAdd(Client::QUEUE_WAITING_PREFIX . $msg['queue'], $score, $packedMessage);
             } else {
-              $this->failMessage($packedMessage, $redis, "Invalid format or missing queue/priority/time from delayed queue");
+              $this->failMessage($packedMessage, $redis, "Invalid format from delayed queue");
             }
           }
         }
@@ -101,82 +80,60 @@ class Consumer
     });
   }
 
-  protected function tryConsume(ConsumerInterface $consumerInstance, string $redisQueueKey): void
+  protected function tryConsume(ConsumerInterface $consumer, string $redisQueueKey): void
   {
     try {
-      $connectionName = property_exists($consumerInstance, 'connection') && !empty($consumerInstance->connection) ? $consumerInstance->connection : 'default';
-      $redis = Redis::connection($connectionName);
-      $result = $redis->execCommand('zPopMin', $redisQueueKey, 1);
-      if (is_array($result) && !empty($result)) {
+      $redis = Redis::connection($consumer->connection ?? 'default');
+      $result = $redis->zPopMin($redisQueueKey, 1);
+      if ($result) {
         $packedMessage = key($result);
         $message = igbinary_unserialize($packedMessage);
-        if (!is_array($message) || !isset($message['data']) || !isset($message['attempts']) || !isset($message['id'])) {
+        if (!is_array($message) || !isset($message['data'], $message['attempts'], $message['id'])) {
           $this->failMessage($packedMessage, $redis, "Invalid message format");
           return;
         }
-        $globalRedisConfig = config('sequency', config('plugin.webman.sequency.redis', []))[$connectionName]['options'] ?? [];
-        $maxAttempts = property_exists($consumerInstance, 'maxAttempts') && is_int($consumerInstance->maxAttempts) ? $consumerInstance->maxAttempts : ($globalRedisConfig['max_attempts'] ?? 5);
-        $retrySeconds = property_exists($consumerInstance, 'retrySeconds') && is_int($consumerInstance->retrySeconds) ? $consumerInstance->retrySeconds : ($globalRedisConfig['retry_seconds'] ?? 5);
-
         try {
-          $consumerInstance->consume($message['data']);
-          // On success, remove the task from the index.
-          $redis->execCommand('hDel', RedisConnection::QUEUE_TASK_INDEX_KEY, $message['id']);
+          $consumer->consume($message['data']);
+          $redis->hDel(Client::QUEUE_TASK_INDEX_KEY, $message['id']);
         } catch (NonRetryableException $e) {
-          $this->failMessage($packedMessage, $redis, $e->getMessage(), $consumerInstance, $message['data'], $e);
+          $this->failMessage($packedMessage, $redis, $e->getMessage(), $consumer, $message['data'], $e);
         } catch (Throwable $e) {
-          $message['attempts'] = ((int)$message['attempts'] ?? 0) + 1;
-          $updatedPackedMessage = igbinary_serialize($message);
-
-          if ($message['attempts'] >= $maxAttempts) {
-            $this->failMessage($updatedPackedMessage, $redis, $e->getMessage(), $consumerInstance, $message['data'], $e);
+          $message['attempts'] = ($message['attempts'] ?? 0) + 1;
+          if ($message['attempts'] >= ($consumer->maxAttempts ?? 5)) {
+            $this->failMessage(igbinary_serialize($message), $redis, $e->getMessage(), $consumer, $message['data'], $e);
           } else {
-            // Task is being retried, so we need to update its package in the index.
-            $delay = $retrySeconds * pow(2, $message['attempts'] - 1);
+            $delay = ($consumer->retrySeconds ?? 5) * pow(2, $message['attempts'] - 1);
             $retryAt = time() + $delay;
-
-            $redis->multi();
-            $redis->hSet(RedisConnection::QUEUE_TASK_INDEX_KEY, $message['id'], $updatedPackedMessage);
-            $redis->zAdd(RedisConnection::QUEUE_DELAYED_KEY, $retryAt, $updatedPackedMessage);
-            $redis->exec();
+            $updatedPackedMessage = igbinary_serialize($message);
+            $retryRedis = Redis::connection();
+            $retryRedis->multi();
+            $retryRedis->hSet(Client::QUEUE_TASK_INDEX_KEY, $message['id'], $updatedPackedMessage);
+            $retryRedis->zAdd(Client::QUEUE_DELAYED_KEY, $retryAt, $updatedPackedMessage);
+            $retryRedis->exec();
           }
         }
       }
     } catch (Throwable) {
-      if (isset($this->_pullTimerIds[$redisQueueKey])) {
-        Timer::del($this->_pullTimerIds[$redisQueueKey]);
-      }
-      $this->_pullTimerIds[$redisQueueKey] = Timer::add(5, function () use ($consumerInstance, $redisQueueKey) {
-        $this->tryConsume($consumerInstance, $redisQueueKey);
-      });
+      if (isset($this->_pullTimerIds[$redisQueueKey])) Timer::del($this->_pullTimerIds[$redisQueueKey]);
+      $this->_pullTimerIds[$redisQueueKey] = Timer::add(5, fn() => $this->tryConsume($consumer, $redisQueueKey));
     }
   }
 
-  protected function failMessage(string $packedMessageOriginal, RedisConnection $redis, string $errorMessage, ?ConsumerInterface $consumer = null, $data = null, ?Throwable $exception = null): void
+  protected function failMessage(string $packedMsg, $redis, string $error, ?ConsumerInterface $consumer = null, $data = null, ?Throwable $e = null): void
   {
-    $message = igbinary_unserialize($packedMessageOriginal);
+    $message = igbinary_unserialize($packedMsg);
     if (is_array($message)) {
-      $message['error'] = $errorMessage;
+      $message['error'] = $error;
       $message['failed_at'] = date('Y-m-d H:i:s');
-      $packedMessageToStore = igbinary_serialize($message);
-      // On final failure, remove the task from the index.
       if (isset($message['id'])) {
-        $redis->execCommand('hDel', RedisConnection::QUEUE_TASK_INDEX_KEY, $message['id']);
+        $redis->hDel(Client::QUEUE_TASK_INDEX_KEY, $message['id']);
       }
-    } else {
-      $packedMessageToStore = igbinary_serialize([
-        'original_payload' => $packedMessageOriginal,
-        'error' => $errorMessage,
-        'failed_at' => date('Y-m-d H:i:s')
-      ]);
+      $packedMsg = igbinary_serialize($message);
     }
-    try {
-      $redis->execCommand('lPush', RedisConnection::QUEUE_FAILED_KEY, $packedMessageToStore);
-    } catch (Throwable) {
-    }
-    if ($consumer && method_exists($consumer, 'onFail') && $data !== null && $exception !== null) {
+    $redis->lPush(Client::QUEUE_FAILED_KEY, [$packedMsg]);
+    if ($consumer && method_exists($consumer, 'onFail')) {
       try {
-        $consumer->onFail($data, $exception);
+        $consumer->onFail($data, $e);
       } catch (Throwable) {
       }
     }
