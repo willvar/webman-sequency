@@ -130,7 +130,7 @@ class Consumer
       }
       $packedMsg = igbinary_serialize($message);
     }
-    $redis->lPush(Client::QUEUE_FAILED_KEY, [$packedMsg]);
+    $redis->lPush(Client::QUEUE_FAILED_KEY, $packedMsg);
     if ($consumer && method_exists($consumer, 'onFail')) {
       try {
         $consumer->onFail($data, $e);
